@@ -12,8 +12,8 @@ load_dotenv()
 # ================= 1. 配置区域 =================
 ROCOM_API_KEY = os.environ.get("ROCOM_API_KEY")
 IMGBB_KEY = os.environ.get("IMGBB_KEY")
-NOTIFYME_UUID = os.environ.get("NOTIFYME_UUID")
-BARK_KEY = os.environ.get("BARK_KEY")
+NOTIFYME_UUIDS = [u.strip() for u in os.environ.get("NOTIFYME_UUID", "").split(",") if u.strip()]
+BARK_KEYS = [k.strip() for k in os.environ.get("BARK_KEY", "").split(",") if k.strip()]
 CHROMIUM_PATH = os.environ.get("CHROMIUM_PATH")  # 可选：自定义 Chromium 路径
 
 GAME_API_URL = "https://wegame.shallow.ink/api/v1/games/rocom/merchant/info"
@@ -263,11 +263,11 @@ async def upload_to_imgbb(image_path):
 # ================= 4. 推送分发 =================
 
 def push_all(title, body, markdown, image_url):
-    """执行双通道推送"""
-    if NOTIFYME_UUID:
+    """执行双通道推送，支持多人"""
+    for uuid in NOTIFYME_UUIDS:
         payload = {
             "data": {
-                "uuid": NOTIFYME_UUID,
+                "uuid": uuid,
                 "ttl": 86400,
                 "priority": "high",
                 "data": {
@@ -282,14 +282,14 @@ def push_all(title, body, markdown, image_url):
         }
         try:
             requests.post(NOTIFYME_SERVER, json=payload, timeout=10)
-            print("✅ NotifyMe 推送已发送")
+            print(f"✅ NotifyMe 推送已发送 → {uuid[:8]}...")
         except:
-            pass
+            print(f"⚠️ NotifyMe 推送失败 → {uuid[:8]}...")
 
-    if BARK_KEY:
+    for key in BARK_KEYS:
         try:
             requests.post(
-                f"https://api.day.app/{BARK_KEY}",
+                f"https://api.day.app/{key}",
                 data={
                     "title": title,
                     "body": body,
@@ -299,9 +299,9 @@ def push_all(title, body, markdown, image_url):
                 },
                 timeout=10,
             )
-            print("✅ Bark 推送已发送")
+            print(f"✅ Bark 推送已发送 → {key[:8]}...")
         except:
-            pass
+            print(f"⚠️ Bark 推送失败 → {key[:8]}...")
 
 
 # ================= 5. 主入口 =================
