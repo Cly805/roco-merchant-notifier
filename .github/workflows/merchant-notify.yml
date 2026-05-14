@@ -2,17 +2,17 @@ name: 远行商人监控
 
 on:
   schedule:
-    # 北京时间 08:00 / 12:00 / 16:00 / 20:00 — 每轮开始后 5 分钟触发
-    - cron: "5 0 * * *"   # UTC 00:05 = 北京 08:05
-    - cron: "5 4 * * *"   # UTC 04:05 = 北京 12:05
-    - cron: "5 8 * * *"   # UTC 08:05 = 北京 16:05
-    - cron: "5 12 * * *"  # UTC 12:05 = 北京 20:05
+    # 北京时间 08:10 / 12:10 / 16:10 / 20:10 — 每轮开始后 10 分钟触发（给 API 足够刷新时间）
+    - cron: "10 0 * * *"   # UTC 00:10 = 北京 08:10
+    - cron: "10 4 * * *"   # UTC 04:10 = 北京 12:10
+    - cron: "10 8 * * *"   # UTC 08:10 = 北京 16:10
+    - cron: "10 12 * * *"  # UTC 12:10 = 北京 20:10
   workflow_dispatch:  # 允许手动触发
 
 jobs:
   notify:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
 
     steps:
       - name: 检出代码
