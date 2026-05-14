@@ -1,6 +1,7 @@
 import os
 import requests
 import asyncio
+import time
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from jinja2 import Environment, FileSystemLoader
@@ -59,6 +60,108 @@ def get_round_info():
     countdown_str = f"{hours}小时{minutes}分钟" if hours > 0 else f"{minutes}分钟"
 
     return {"current": round_index, "total": 4, "countdown": countdown_str}
+
+
+def get_expected_round_start_ms():
+    """
+    计算当前轮次预期开始时间的毫秒时间戳。
+    用于校验 API 返回数据是否属于当前轮次。
+    """
+    now = get_beijing_time()
+    day_start = now.replace(hour=8, minute=0, second=0, microsecond=0)
+
+    if now < day_start:
+        return None  # 未开市
+
+    delta_seconds = int((now - day_start).total_seconds())
+    round_index = delta_seconds // (4 * 3600)  # 0-indexed: 0=8:00, 1=12:00, 2=16:00, 3=20:00
+
+    if round_index > 3:
+        return None  # 已收市
+
+    round_start = day_start + timedelta(hours=round_index * 4)
+    return int(round_start.timestamp() * 1000)
+
+
+def validate_round_data(raw_data, tolerance_minutes=20):
+    """
+    校验 API 返回数据是否属于当前轮次。
+    检查至少有一个商品的 start_time 落在当前轮次预期开始时间的 ±tolerance 范围内。
+    返回 True 表示数据有效，False 表示可能是缓存旧数据。
+    """
+    expected_start_ms = get_expected_round_start_ms()
+    if expected_start_ms is None:
+        # 未开市或已收市，不需要验证
+        return True
+
+    tolerance_ms = tolerance_minutes * 60 * 1000
+
+    activities = raw_data.get("merchantActivities") or raw_data.get("merchant_activities") or []
+
+    for activity in activities:
+        for bucket_key in ("get_props", "get_extra_props", "get_pets"):
+            items = activity.get(bucket_key) or []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                s_time = item.get("start_time") or activity.get("start_time")
+                if s_time:
+                    item_start_ms = int(s_time)
+                    # 商品开始时间在预期轮次开始时间的 ±tolerance 范围内
+                    if abs(item_start_ms - expected_start_ms) < tolerance_ms:
+                        return True
+
+    print(f"⚠️ 轮次校验失败: 未找到属于当前轮次（预期开始 {expected_start_ms}）的商品")
+    return False
+
+
+def fetch_merchant_data(max_retries=3, retry_delay=20):
+    """
+    获取远行商人数据，带破缓存和轮次校验重试。
+    解决第三方 API 缓存延迟导致「落后一轮」的问题。
+    """
+    for attempt in range(1, max_retries + 1):
+        # cache-busting: 加时间戳参数破 CDN/代理缓存
+        cache_buster = int(time.time() * 1000)
+        url = f"{GAME_API_URL}?_t={cache_buster}"
+
+        try:
+            resp = requests.get(url, headers={"X-API-Key": ROCOM_API_KEY}, timeout=30)
+            resp.raise_for_status()
+            json_data = resp.json()
+
+            if json_data.get("code") != 0:
+                err_msg = json_data.get("message", "API 返回错误")
+                print(f"❌ API 错误 (尝试 {attempt}/{max_retries}): {err_msg}")
+                if attempt < max_retries:
+                    time.sleep(retry_delay)
+                    continue
+                return None, err_msg
+
+            raw_data = json_data.get("data", {})
+
+            # 轮次校验：确保数据属于当前轮次
+            if validate_round_data(raw_data):
+                print(f"✅ 数据获取成功，通过轮次校验 (尝试 {attempt}/{max_retries})")
+                return raw_data, None
+            else:
+                print(f"⚠️ 数据可能是旧轮次缓存 (尝试 {attempt}/{max_retries})")
+                if attempt < max_retries:
+                    print(f"   等待 {retry_delay} 秒后重试...")
+                    time.sleep(retry_delay)
+                else:
+                    # 最后一次尝试，尽最大努力使用当前数据
+                    print("⚠️ 已达最大重试次数，使用当前数据（可能为旧轮次）")
+                    return raw_data, None
+
+        except Exception as e:
+            print(f"❌ 请求异常 (尝试 {attempt}/{max_retries}): {e}")
+            if attempt < max_retries:
+                time.sleep(retry_delay)
+                continue
+            return None, f"请求异常: {e}"
+
+    return None, "未知错误"
 
 
 def process_data_for_template(data):
@@ -307,13 +410,8 @@ def push_all(title, body, markdown, image_url):
 # ================= 5. 主入口 =================
 
 async def main():
-    try:
-        resp = requests.get(GAME_API_URL, headers={"X-API-Key": ROCOM_API_KEY}, timeout=30)
-        resp.raise_for_status()
-        raw_data = resp.json().get("data", {})
-        err = None if resp.json().get("code") == 0 else resp.json().get("message")
-    except Exception as e:
-        raw_data, err = None, f"请求异常: {e}"
+    # 使用带重试和轮次校验的 fetch，自动破缓存
+    raw_data, err = fetch_merchant_data(max_retries=3, retry_delay=20)
 
     if err or not raw_data:
         push_all("⚠️ 监控异常", err or "无法获取数据", "无法获取数据", None)
