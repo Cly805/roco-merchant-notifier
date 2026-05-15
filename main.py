@@ -115,10 +115,14 @@ def validate_round_data(raw_data, tolerance_minutes=20):
     return False
 
 
-def fetch_merchant_data(max_retries=3, retry_delay=20):
+def fetch_merchant_data(max_retries=8, retry_delay=15, stale_fallback=False):
     """
     获取远行商人数据，带破缓存和轮次校验重试。
     解决第三方 API 缓存延迟导致「落后一轮」的问题。
+
+    max_retries: 最大重试次数 (默认 8 次)
+    retry_delay: 重试间隔秒数 (默认 15 秒)，总等待最长约 120 秒
+    stale_fallback: 重试耗尽后是否降级使用旧数据 (默认 False，不发旧数据)
     """
     for attempt in range(1, max_retries + 1):
         # cache-busting: 加时间戳参数破 CDN/代理缓存
@@ -145,14 +149,19 @@ def fetch_merchant_data(max_retries=3, retry_delay=20):
                 print(f"✅ 数据获取成功，通过轮次校验 (尝试 {attempt}/{max_retries})")
                 return raw_data, None
             else:
-                print(f"⚠️ 数据可能是旧轮次缓存 (尝试 {attempt}/{max_retries})")
+                elapsed = attempt * retry_delay
+                print(f"⚠️ 数据可能是旧轮次缓存 (尝试 {attempt}/{max_retries}，已等待 ~{elapsed}s)")
                 if attempt < max_retries:
                     print(f"   等待 {retry_delay} 秒后重试...")
                     time.sleep(retry_delay)
                 else:
-                    # 最后一次尝试，尽最大努力使用当前数据
-                    print("⚠️ 已达最大重试次数，使用当前数据（可能为旧轮次）")
-                    return raw_data, None
+                    total_wait = max_retries * retry_delay
+                    if stale_fallback:
+                        print(f"⚠️ 已达最大重试次数 (~{total_wait}s)，降级使用当前数据（可能为旧轮次）")
+                        return raw_data, None
+                    else:
+                        print(f"❌ 已达最大重试次数 (~{total_wait}s)，数据仍为旧轮次，放弃推送")
+                        return None, "数据暂未更新（第三方 API 缓存延迟），请稍后重试"
 
         except Exception as e:
             print(f"❌ 请求异常 (尝试 {attempt}/{max_retries}): {e}")
@@ -411,7 +420,9 @@ def push_all(title, body, markdown, image_url):
 
 async def main():
     # 使用带重试和轮次校验的 fetch，自动破缓存
-    raw_data, err = fetch_merchant_data(max_retries=3, retry_delay=20)
+    # 8 次重试 × 15 秒 = 最多等待 120 秒，给第三方 API 缓存足够的刷新时间
+    # stale_fallback=False: 超时后不发旧数据，推警告通知
+    raw_data, err = fetch_merchant_data(max_retries=8, retry_delay=15, stale_fallback=False)
 
     if err or not raw_data:
         push_all("⚠️ 监控异常", err or "无法获取数据", "无法获取数据", None)
