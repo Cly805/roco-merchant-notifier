@@ -83,10 +83,17 @@ def get_expected_round_start_ms():
     return int(round_start.timestamp() * 1000)
 
 
-def validate_round_data(raw_data, tolerance_minutes=20):
+def validate_round_data(raw_data, tolerance_minutes=20, require_active=True):
     """
     校验 API 返回数据是否属于当前轮次。
-    检查至少有一个商品的 start_time 落在当前轮次预期开始时间的 ±tolerance 范围内。
+    严格模式：只使用商品自带的显式 start_time，不回退到活动级别 start_time。
+    防止 API 提前更新活动时间戳而商品列表未刷新导致「落后一轮」的问题。
+
+    检查至少有一个商品满足：
+      1. 自带显式 start_time（不回退到活动级别）
+      2. start_time 落在当前轮次预期开始时间的 ±tolerance 范围内
+      3. (可选) end_time > now，确保商品仍在有效期内
+
     返回 True 表示数据有效，False 表示可能是缓存旧数据。
     """
     expected_start_ms = get_expected_round_start_ms()
@@ -95,6 +102,7 @@ def validate_round_data(raw_data, tolerance_minutes=20):
         return True
 
     tolerance_ms = tolerance_minutes * 60 * 1000
+    now_ms = int(get_beijing_time().timestamp() * 1000)
 
     activities = raw_data.get("merchantActivities") or raw_data.get("merchant_activities") or []
 
@@ -104,26 +112,57 @@ def validate_round_data(raw_data, tolerance_minutes=20):
             for item in items:
                 if not isinstance(item, dict):
                     continue
-                s_time = item.get("start_time") or activity.get("start_time")
-                if s_time:
-                    item_start_ms = int(s_time)
-                    # 商品开始时间在预期轮次开始时间的 ±tolerance 范围内
-                    if abs(item_start_ms - expected_start_ms) < tolerance_ms:
-                        return True
+                # 严格模式：只用商品自身的 start_time，不回退到活动级别
+                # 这是关键修复：活动 start_time 可能提前更新，但商品数据仍是旧的
+                s_time = item.get("start_time")
+                if not s_time:
+                    continue
+                item_start_ms = int(s_time)
+                if abs(item_start_ms - expected_start_ms) < tolerance_ms:
+                    # 通过时间校验后，再检查商品是否已过期
+                    if require_active:
+                        e_time = item.get("end_time")
+                        if e_time:
+                            item_end_ms = int(e_time)
+                            if item_end_ms <= now_ms:
+                                # 商品已过期，可能是旧轮次残留数据
+                                continue
+                    return True
 
-    print(f"⚠️ 轮次校验失败: 未找到属于当前轮次（预期开始 {expected_start_ms}）的商品")
+    print(f"⚠️ 轮次校验失败: 未找到自带显式 start_time 且匹配当前轮次（预期开始 {expected_start_ms}）的商品")
     return False
+
+
+def hash_merchant_items(raw_data):
+    """计算商品名称的稳定哈希，用于检测数据是否真正更新"""
+    import hashlib
+    names = []
+    activities = raw_data.get("merchantActivities") or raw_data.get("merchant_activities") or []
+    for activity in activities:
+        for bucket_key in ("get_props", "get_extra_props", "get_pets"):
+            items = activity.get(bucket_key) or []
+            for item in items:
+                if isinstance(item, dict) and item.get("name"):
+                    names.append(item["name"])
+    names.sort()
+    return hashlib.md5("|".join(names).encode()).hexdigest()
 
 
 def fetch_merchant_data(max_retries=8, retry_delay=15, stale_fallback=False):
     """
-    获取远行商人数据，带破缓存和轮次校验重试。
+    获取远行商人数据，带破缓存、轮次校验和内容稳定性检查。
     解决第三方 API 缓存延迟导致「落后一轮」的问题。
+
+    新增内容稳定性检查：连续两次抓取商品名称一致才接受，
+    防止 API 中途更新时推送不完整的数据。
 
     max_retries: 最大重试次数 (默认 8 次)
     retry_delay: 重试间隔秒数 (默认 15 秒)，总等待最长约 120 秒
     stale_fallback: 重试耗尽后是否降级使用旧数据 (默认 False，不发旧数据)
     """
+    last_items_hash = None
+    stable_count = 0
+
     for attempt in range(1, max_retries + 1):
         # cache-busting: 加时间戳参数破 CDN/代理缓存
         cache_buster = int(time.time() * 1000)
@@ -137,6 +176,8 @@ def fetch_merchant_data(max_retries=8, retry_delay=15, stale_fallback=False):
             if json_data.get("code") != 0:
                 err_msg = json_data.get("message", "API 返回错误")
                 print(f"❌ API 错误 (尝试 {attempt}/{max_retries}): {err_msg}")
+                last_items_hash = None
+                stable_count = 0
                 if attempt < max_retries:
                     time.sleep(retry_delay)
                     continue
@@ -144,11 +185,40 @@ def fetch_merchant_data(max_retries=8, retry_delay=15, stale_fallback=False):
 
             raw_data = json_data.get("data", {})
 
-            # 轮次校验：确保数据属于当前轮次
+            # 轮次校验（严格模式）：确保数据自带 start_time 且属于当前轮次
             if validate_round_data(raw_data):
-                print(f"✅ 数据获取成功，通过轮次校验 (尝试 {attempt}/{max_retries})")
-                return raw_data, None
+                current_hash = hash_merchant_items(raw_data)
+
+                # 内容稳定性检查：连续两次抓取的商品名称一致，才视为数据稳定
+                # 防止 API 中途更新导致推送不完整或混合数据
+                if last_items_hash is not None and current_hash == last_items_hash:
+                    stable_count += 1
+                    if stable_count >= 2:
+                        print(f"✅ 数据稳定（连续 {stable_count} 次内容一致 + 轮次校验通过），推送触发 (尝试 {attempt}/{max_retries})")
+                        return raw_data, None
+                    else:
+                        elapsed = attempt * retry_delay
+                        print(f"⏳ 轮次校验通过，内容稳定性确认中 ({stable_count}/2, 尝试 {attempt}/{max_retries}, 已等待 ~{elapsed}s)")
+                else:
+                    if last_items_hash is not None:
+                        print(f"🔄 商品内容变化，重置稳定性计数 (尝试 {attempt}/{max_retries})")
+                    else:
+                        elapsed = attempt * retry_delay
+                        print(f"✅ 轮次校验通过，等待内容稳定 (尝试 {attempt}/{max_retries}, 已等待 ~{elapsed}s)")
+                    stable_count = 0
+                    last_items_hash = current_hash
+
+                if attempt < max_retries:
+                    time.sleep(retry_delay)
+                    continue
+                else:
+                    total_wait = max_retries * retry_delay
+                    print(f"❌ 已达最大重试次数 (~{total_wait}s)，内容一直未稳定，放弃推送")
+                    return None, "数据内容不稳定（API 持续更新中），请稍后重试"
             else:
+                # 轮次校验失败，重置稳定性状态
+                last_items_hash = None
+                stable_count = 0
                 elapsed = attempt * retry_delay
                 print(f"⚠️ 数据可能是旧轮次缓存 (尝试 {attempt}/{max_retries}，已等待 ~{elapsed}s)")
                 if attempt < max_retries:
@@ -165,6 +235,8 @@ def fetch_merchant_data(max_retries=8, retry_delay=15, stale_fallback=False):
 
         except Exception as e:
             print(f"❌ 请求异常 (尝试 {attempt}/{max_retries}): {e}")
+            last_items_hash = None
+            stable_count = 0
             if attempt < max_retries:
                 time.sleep(retry_delay)
                 continue
